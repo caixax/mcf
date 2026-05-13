@@ -4,7 +4,7 @@
 # Author: caixax - dios
 # Description: Manage multiple Cloudflare tunnels with different accounts on a single VPS.
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 BASE_DIR="$HOME/.multi-cloudflared"
 USERS_DIR="$BASE_DIR/users"
 TUNNELS_DIR="$BASE_DIR/tunnels"
@@ -130,7 +130,12 @@ cmd_create_user() {
     fi
 
     log_info "Creating user '$username'..."
-    
+
+    # Multi-tenancy: cada user tiene su propio cert.pem aislado en $USERS_DIR/<user>/cert.pem.
+    # `cloudflared tunnel login` siempre escribe a ~/.cloudflared/cert.pem (path fijo de cloudflared),
+    # así que: (1) backup del cert.pem global si existe, (2) login, (3) mover el nuevo cert a la
+    # carpeta del user, (4) restaurar el backup. Tras esto ~/.cloudflared/ queda libre para que
+    # el siguiente `mcf create user` no pise la cuenta anterior.
     if [ -f "$DEFAULT_CLOUDFLARED_DIR/cert.pem" ]; then
         log_warning "Backing up existing global cert.pem..."
         mv "$DEFAULT_CLOUDFLARED_DIR/cert.pem" "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak"
@@ -204,11 +209,23 @@ cmd_create_tunnel() {
     [ -d "$tunnel_dir" ] && { log_error "Tunnel exists"; return 1; }
 
     log_info "Creating tunnel '$tunnel_name'..."
+
+    # Preparar destino ANTES de invocar cloudflared: con --output json el JSON va a stdout
+    # y cloudflared NO escribe el creds.json a ~/.cloudflared/<UUID>.json por defecto;
+    # hay que pasarle --credentials-file explícitamente para que lo escriba en su sitio final.
+    mkdir -p "$tunnel_dir"
+    local creds_path="$tunnel_dir/creds.json"
+    # Cleanup defensivo: si quedó un creds.json de un intento previo fallido, cloudflared abortaría
+    rm -f "$creds_path"
+
     local output
     # cloudflared 2024+: --origincert es flag global del subcomando `tunnel` (va ANTES de `create`).
-    # --output json: devuelve {"id":..., "credentials_file":...} parseable sin ambigüedad,
-    # evita el bug previo donde el grep capturaba dos UUIDs (path + "with id") y los concatenaba con \n.
-    output=$(cloudflared tunnel --origincert "$user_cert" create --output json "$tunnel_name" 2>&1)
+    # --output json + --credentials-file son SUBCOMMAND OPTIONS del create (van DESPUÉS).
+    # JSON en stdout para parseo limpio del UUID; creds.json escrito directamente al tunnel_dir.
+    output=$(cloudflared tunnel --origincert "$user_cert" create \
+        --output json \
+        --credentials-file "$creds_path" \
+        "$tunnel_name" 2>&1)
     local create_rc=$?
 
     # Parseo robusto vía jq; fallback a regex estricta + head -n1 si cloudflared no devolviera JSON
@@ -222,27 +239,29 @@ cmd_create_tunnel() {
     if [ "$create_rc" -ne 0 ] || [ -z "$uuid" ]; then
         log_error "Failed to create tunnel or get UUID."
         echo "$output"
+        # Limpieza si cloudflared dejó un creds.json a medias o el tunnel_dir vacío
+        rm -f "$creds_path"
+        rmdir "$tunnel_dir" 2>/dev/null
         return 1
     fi
 
-    # Path de credenciales: usar el del JSON si existe, derivar del UUID si no
-    local creds_path
-    creds_path=$(echo "$output" | jq -r '.credentials_file' 2>/dev/null)
-    if [ -z "$creds_path" ] || [ "$creds_path" = "null" ] || [ ! -f "$creds_path" ]; then
-        creds_path="$DEFAULT_CLOUDFLARED_DIR/$uuid.json"
+    # Sanity check: el creds.json debe existir en el path que le dimos
+    if [ ! -f "$creds_path" ]; then
+        log_error "Tunnel created in Cloudflare but credentials file missing at $creds_path"
+        echo "$output"
+        return 1
     fi
 
-    mkdir -p "$tunnel_dir"
-    mv "$creds_path" "$tunnel_dir/creds.json"
-
     # Save meta — printf %s evita que un valor con \n rompa la línea;
-    # CREATED_AT en ISO (sin espacios) para que `source $meta` no interprete "May" como comando
+    # CREATED_AT en ISO (sin espacios) para que `source $meta` no interprete "May" como comando.
+    # CREDS apunta al path final del creds.json (escrito por cloudflared, no movido por nosotros).
     local id=$(get_next_id)
     {
         printf 'UUID=%s\n' "$uuid"
         printf 'USER=%s\n' "$username"
         printf 'NAME=%s\n' "$tunnel_name"
         printf 'ID=%s\n' "$id"
+        printf 'CREDS=%s\n' "$creds_path"
         printf 'CREATED_AT=%s\n' "$(date -Iseconds)"
     } > "$tunnel_dir/meta"
 
@@ -386,20 +405,15 @@ cmd_route_tunnel() {
     local user_cert="$USERS_DIR/$user/cert.pem"
     
     [ ! -f "$user_cert" ] && { log_error "User cert missing"; return 1; }
-    
-    # Swap certs
-    if [ -f "$DEFAULT_CLOUDFLARED_DIR/cert.pem" ]; then
-        mv "$DEFAULT_CLOUDFLARED_DIR/cert.pem" "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak"
-    fi
-    cp "$user_cert" "$DEFAULT_CLOUDFLARED_DIR/cert.pem"
-    
-    cloudflared tunnel route dns "$uuid" "$hostname"
+
+    # Multi-tenant safe: usar --origincert con el cert del USUARIO del túnel (no el global).
+    # Antes copiábamos el cert al ~/.cloudflared/cert.pem global y lo restaurábamos — racy
+    # entre comandos concurrentes y dejaba estado global pisado si fallaba el restore.
+    # --origincert va ANTES del subsubcomando `route` (flag global del subcomando tunnel).
+    cloudflared tunnel --origincert "$user_cert" route dns "$uuid" "$hostname"
     local ret=$?
-    
-    # Restore
-    rm "$DEFAULT_CLOUDFLARED_DIR/cert.pem"
-    [ -f "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak" ] && mv "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak" "$DEFAULT_CLOUDFLARED_DIR/cert.pem"
-    
+
+
     if [ $ret -eq 0 ]; then
         # Acumular hostnames como lista CSV en una sola línea HOSTNAME=...
         # (antes sobreescribía, así `mcf list` solo mostraba el último route)
