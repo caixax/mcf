@@ -4,7 +4,7 @@
 # Author: caixax - dios
 # Description: Manage multiple Cloudflare tunnels with different accounts on a single VPS.
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 BASE_DIR="$HOME/.multi-cloudflared"
 USERS_DIR="$BASE_DIR/users"
 TUNNELS_DIR="$BASE_DIR/tunnels"
@@ -205,7 +205,8 @@ cmd_create_tunnel() {
 
     log_info "Creating tunnel '$tunnel_name'..."
     local output
-    output=$(cloudflared tunnel create --origincert "$user_cert" "$tunnel_name" 2>&1)
+    # cloudflared 2024+: --origincert es flag global del subcomando `tunnel`, debe ir ANTES de `create`
+    output=$(cloudflared tunnel --origincert "$user_cert" create "$tunnel_name" 2>&1)
     
     local uuid=$(echo "$output" | grep -oP 'Created tunnel \K[a-f0-9-]+(?= with id)')
     [ -z "$uuid" ] && uuid=$(echo "$output" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
