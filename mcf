@@ -4,7 +4,7 @@
 # Author: caixax - dios
 # Description: Manage multiple Cloudflare tunnels with different accounts on a single VPS.
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 BASE_DIR="$HOME/.multi-cloudflared"
 USERS_DIR="$BASE_DIR/users"
 TUNNELS_DIR="$BASE_DIR/tunnels"
@@ -205,29 +205,46 @@ cmd_create_tunnel() {
 
     log_info "Creating tunnel '$tunnel_name'..."
     local output
-    # cloudflared 2024+: --origincert es flag global del subcomando `tunnel`, debe ir ANTES de `create`
-    output=$(cloudflared tunnel --origincert "$user_cert" create "$tunnel_name" 2>&1)
-    
-    local uuid=$(echo "$output" | grep -oP 'Created tunnel \K[a-f0-9-]+(?= with id)')
-    [ -z "$uuid" ] && uuid=$(echo "$output" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-    
-    if [ -z "$uuid" ]; then
+    # cloudflared 2024+: --origincert es flag global del subcomando `tunnel` (va ANTES de `create`).
+    # --output json: devuelve {"id":..., "credentials_file":...} parseable sin ambigüedad,
+    # evita el bug previo donde el grep capturaba dos UUIDs (path + "with id") y los concatenaba con \n.
+    output=$(cloudflared tunnel --origincert "$user_cert" create --output json "$tunnel_name" 2>&1)
+    local create_rc=$?
+
+    # Parseo robusto vía jq; fallback a regex estricta + head -n1 si cloudflared no devolviera JSON
+    local uuid
+    uuid=$(echo "$output" | jq -r '.id' 2>/dev/null)
+    if [ -z "$uuid" ] || [ "$uuid" = "null" ]; then
+        # Fallback legacy: primera UUID válida, head -n1 evita concatenar varias, tr limpia \n y espacios
+        uuid=$(echo "$output" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1 | tr -d '[:space:]')
+    fi
+
+    if [ "$create_rc" -ne 0 ] || [ -z "$uuid" ]; then
         log_error "Failed to create tunnel or get UUID."
         echo "$output"
         return 1
     fi
 
-    local creds_path="$DEFAULT_CLOUDFLARED_DIR/$uuid.json"
+    # Path de credenciales: usar el del JSON si existe, derivar del UUID si no
+    local creds_path
+    creds_path=$(echo "$output" | jq -r '.credentials_file' 2>/dev/null)
+    if [ -z "$creds_path" ] || [ "$creds_path" = "null" ] || [ ! -f "$creds_path" ]; then
+        creds_path="$DEFAULT_CLOUDFLARED_DIR/$uuid.json"
+    fi
+
     mkdir -p "$tunnel_dir"
     mv "$creds_path" "$tunnel_dir/creds.json"
-    
-    # Save meta
+
+    # Save meta — printf %s evita que un valor con \n rompa la línea;
+    # CREATED_AT en ISO (sin espacios) para que `source $meta` no interprete "May" como comando
     local id=$(get_next_id)
-    echo "UUID=$uuid" > "$tunnel_dir/meta"
-    echo "USER=$username" >> "$tunnel_dir/meta"
-    echo "NAME=$tunnel_name" >> "$tunnel_dir/meta"
-    echo "ID=$id" >> "$tunnel_dir/meta"
-    echo "CREATED_AT=$(date)" >> "$tunnel_dir/meta"
+    {
+        printf 'UUID=%s\n' "$uuid"
+        printf 'USER=%s\n' "$username"
+        printf 'NAME=%s\n' "$tunnel_name"
+        printf 'ID=%s\n' "$id"
+        printf 'CREATED_AT=%s\n' "$(date -Iseconds)"
+    } > "$tunnel_dir/meta"
 
     # Add to DB
     add_to_db "$id" "$tunnel_name" "$username"
@@ -384,9 +401,22 @@ cmd_route_tunnel() {
     [ -f "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak" ] && mv "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak" "$DEFAULT_CLOUDFLARED_DIR/cert.pem"
     
     if [ $ret -eq 0 ]; then
+        # Acumular hostnames como lista CSV en una sola línea HOSTNAME=...
+        # (antes sobreescribía, así `mcf list` solo mostraba el último route)
+        local existing_hostnames
+        existing_hostnames=$(grep "^HOSTNAME=" "$tunnel_dir/meta" | cut -d= -f2-)
+        local new_hostnames
+        if [ -z "$existing_hostnames" ]; then
+            new_hostnames="$hostname"
+        elif [[ ",$existing_hostnames," == *",$hostname,"* ]]; then
+            # Ya está en la lista, no duplicar
+            new_hostnames="$existing_hostnames"
+        else
+            new_hostnames="$existing_hostnames,$hostname"
+        fi
         grep -v "^HOSTNAME=" "$tunnel_dir/meta" > "$tunnel_dir/meta.tmp"
         mv "$tunnel_dir/meta.tmp" "$tunnel_dir/meta"
-        echo "HOSTNAME=$hostname" >> "$tunnel_dir/meta"
+        printf 'HOSTNAME=%s\n' "$new_hostnames" >> "$tunnel_dir/meta"
         log_success "Routed $hostname -> $tunnel_name"
     else
         log_error "Failed to route"
