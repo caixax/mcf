@@ -4,120 +4,264 @@
 # Author: caixax - dios
 # Description: Manage multiple Cloudflare tunnels with different accounts on a single VPS.
 
-VERSION="1.1.3"
+set -euo pipefail
+
+VERSION="1.2.0"
 BASE_DIR="$HOME/.multi-cloudflared"
 USERS_DIR="$BASE_DIR/users"
 TUNNELS_DIR="$BASE_DIR/tunnels"
 LOGS_DIR="$BASE_DIR/logs"
-DB_FILE="$BASE_DIR/index.db"
 DUMP_FILE="$BASE_DIR/dump.json"
 DEFAULT_CLOUDFLARED_DIR="$HOME/.cloudflared"
+CF_API_BASE="https://api.cloudflare.com/client/v4"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+# ANSI-C quoting → real ESC bytes; safe with both echo and printf, no -e/%b needed.
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
 
-# Helper Functions
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_info()    { printf '%s[INFO]%s %s\n'    "$BLUE"   "$NC" "$1"; }
+log_success() { printf '%s[SUCCESS]%s %s\n' "$GREEN"  "$NC" "$1"; }
+log_warning() { printf '%s[WARNING]%s %s\n' "$YELLOW" "$NC" "$1"; }
+log_error()   { printf '%s[ERROR]%s %s\n'   "$RED"    "$NC" "$1" >&2; }
 
 check_deps() {
-    if ! command -v cloudflared &> /dev/null; then
-        log_error "cloudflared is not installed. Please install it first."
-        exit 1
-    fi
-    if ! command -v jq &> /dev/null; then
-        log_warning "jq is not installed. Installing..."
-        if [ -f /etc/debian_version ]; then
-            sudo apt-get update && sudo apt-get install -y jq
-        else
-            log_error "Please install 'jq' manually."
-            exit 1
-        fi
+    local missing=()
+    command -v cloudflared >/dev/null 2>&1 || missing+=("cloudflared")
+    command -v jq          >/dev/null 2>&1 || missing+=("jq")
+    command -v curl        >/dev/null 2>&1 || missing+=("curl")
+    if [ ${#missing[@]} -gt 0 ]; then
+        log_error "Missing dependencies: ${missing[*]}"
+        return 1
     fi
 }
 
 init_dirs() {
-    mkdir -p "$USERS_DIR"
-    mkdir -p "$TUNNELS_DIR"
-    mkdir -p "$LOGS_DIR"
-    if [ ! -f "$DB_FILE" ]; then
-        touch "$DB_FILE"
-    fi
+    mkdir -p "$USERS_DIR" "$TUNNELS_DIR" "$LOGS_DIR"
 }
 
-# Banner
 show_banner() {
-    echo -e "${YELLOW}"
-    echo "  __  __  _____ ______ "
-    echo " |  \/  |/ ____|  ____|"
-    echo " | \  / | |    | |__   "
-    echo " | |\/| | |    |  __|  "
-    echo " | |  | | |____| |     "
-    echo " |_|  |_|\_____|_|     "
-    echo -e "${NC}"
+    printf '%s' "$YELLOW"
+    cat <<'EOF'
+  __  __  _____ ______
+ |  \/  |/ ____|  ____|
+ | \  / | |    | |__
+ | |\/| | |    |  __|
+ | |  | | |____| |
+ |_|  |_|\_____|_|
+EOF
+    printf '%s' "$NC"
     echo " Multi-Cloudflared Manager (mcf)"
     echo " By caixax - dios"
     echo " Version: $VERSION"
     echo "---------------------------------"
 }
 
-# DB Helpers
+# --- Meta helpers (JSON via jq, with on-demand legacy KEY=value migration) ---
+
+meta_ensure_json() {
+    local meta_file=$1
+    [ -f "$meta_file" ] || return 0
+    if jq -e 'type=="object"' "$meta_file" >/dev/null 2>&1; then
+        return 0
+    fi
+    # Legacy KEY=value → JSON. HOSTNAME (csv) becomes hostnames[]; everything else
+    # becomes a lowercased string key. Done file-locally so we never lose data.
+    local tmp tmp2 line key value lkey
+    tmp=$(mktemp)
+    echo '{}' > "$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        [ -z "$key" ] && continue
+        lkey=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
+        tmp2=$(mktemp)
+        if [ "$lkey" = "hostname" ]; then
+            jq --arg v "$value" '.hostnames = ($v | split(",") | map(select(. != "")))' "$tmp" > "$tmp2"
+        else
+            jq --arg k "$lkey" --arg v "$value" '.[$k] = $v' "$tmp" > "$tmp2"
+        fi
+        mv "$tmp2" "$tmp"
+    done < "$meta_file"
+    mv "$tmp" "$meta_file"
+}
+
+meta_get() {
+    local meta_file=$1
+    local key=$2
+    [ -f "$meta_file" ] || return 0
+    meta_ensure_json "$meta_file"
+    jq -r --arg k "$key" '.[$k] // empty' "$meta_file" 2>/dev/null || true
+}
+
+meta_get_array() {
+    local meta_file=$1
+    local key=$2
+    [ -f "$meta_file" ] || return 0
+    meta_ensure_json "$meta_file"
+    jq -r --arg k "$key" '(.[$k] // [])[]' "$meta_file" 2>/dev/null || true
+}
+
+meta_set() {
+    local meta_file=$1
+    local key=$2
+    local value=$3
+    local tmp
+    tmp=$(mktemp)
+    if [ -f "$meta_file" ]; then
+        meta_ensure_json "$meta_file"
+        jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$meta_file" > "$tmp"
+    else
+        jq -n --arg k "$key" --arg v "$value" '{($k): $v}' > "$tmp"
+    fi
+    mv "$tmp" "$meta_file"
+}
+
+meta_add_to_array() {
+    local meta_file=$1
+    local key=$2
+    local value=$3
+    local tmp
+    tmp=$(mktemp)
+    if [ -f "$meta_file" ]; then
+        meta_ensure_json "$meta_file"
+        jq --arg k "$key" --arg v "$value" \
+           '.[$k] = ((.[$k] // []) + [$v] | unique)' "$meta_file" > "$tmp"
+    else
+        jq -n --arg k "$key" --arg v "$value" '{($k): [$v]}' > "$tmp"
+    fi
+    mv "$tmp" "$meta_file"
+}
+
+# --- State helpers (filesystem-driven; no separate DB index) ---
+
+is_running() {
+    local tunnel_dir=$1
+    local pid_file="$tunnel_dir/pid"
+    [ -f "$pid_file" ] || return 1
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null || echo "")
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    ps -p "$pid" > /dev/null 2>&1
+}
+
 get_next_id() {
-    local max_id=0
-    if [ -f "$DB_FILE" ]; then
-        while IFS='|' read -r id name user; do
+    local max_id=0 id meta
+    if [ -d "$TUNNELS_DIR" ]; then
+        for meta in "$TUNNELS_DIR"/*/meta; do
+            [ -f "$meta" ] || continue
+            id=$(meta_get "$meta" "id")
             if [[ "$id" =~ ^[0-9]+$ ]] && [ "$id" -gt "$max_id" ]; then
                 max_id=$id
             fi
-        done < "$DB_FILE"
+        done
     fi
     echo $((max_id + 1))
 }
 
-add_to_db() {
-    local id=$1
-    local name=$2
-    local user=$3
-    echo "$id|$name|$user" >> "$DB_FILE"
-}
-
-remove_from_db() {
-    local id=$1
-    local temp_file="$DB_FILE.tmp"
-    grep -v "^$id|" "$DB_FILE" > "$temp_file"
-    mv "$temp_file" "$DB_FILE"
-}
-
-get_tunnel_by_id_or_name() {
+resolve_tunnel_name() {
     local input=$1
-    local tunnel_name=""
-    
-    # Check if input is ID
     if [[ "$input" =~ ^[0-9]+$ ]]; then
-        tunnel_name=$(grep "^$input|" "$DB_FILE" | cut -d'|' -f2)
-    else
-        # Input is Name
-        tunnel_name=$input
+        local meta id
+        for meta in "$TUNNELS_DIR"/*/meta; do
+            [ -f "$meta" ] || continue
+            id=$(meta_get "$meta" "id")
+            if [ "$id" = "$input" ]; then
+                basename "$(dirname "$meta")"
+                return 0
+            fi
+        done
     fi
-    echo "$tunnel_name"
+    if [ -d "$TUNNELS_DIR/$input" ]; then
+        echo "$input"
+        return 0
+    fi
+    return 1
 }
 
-get_id_by_name() {
-    local name=$1
-    grep "|${name}|" "$DB_FILE" | cut -d'|' -f1
+read_user_api_token() {
+    local user=$1
+    local token_file="$USERS_DIR/$user/api_token"
+    if [ -f "$token_file" ]; then
+        tr -d '[:space:]' < "$token_file"
+    fi
 }
 
-# Commands
+# --- Cloudflare API helpers (DNS record cleanup on delete) ---
+
+cf_find_zone_id() {
+    local api_token=$1
+    local hostname=$2
+    local zone_name="$hostname" resp zone_id
+    # Walk up the FQDN until Cloudflare recognises a zone the token has access to.
+    while true; do
+        resp=$(curl -sS --max-time 10 -X GET "${CF_API_BASE}/zones?name=${zone_name}" \
+            -H "Authorization: Bearer $api_token" \
+            -H "Content-Type: application/json" 2>/dev/null || echo '{}')
+        zone_id=$(echo "$resp" | jq -r '.result[0].id // empty' 2>/dev/null || echo "")
+        if [ -n "$zone_id" ]; then
+            echo "$zone_id"
+            return 0
+        fi
+        if [[ "$zone_name" == *.* ]]; then
+            zone_name="${zone_name#*.}"
+        else
+            return 1
+        fi
+    done
+}
+
+cf_delete_dns_record() {
+    local api_token=$1
+    local hostname=$2
+
+    if [ -z "$api_token" ]; then
+        log_warning "No API token for this user; skipping DNS cleanup for $hostname"
+        return 0
+    fi
+
+    local zone_id
+    zone_id=$(cf_find_zone_id "$api_token" "$hostname" || true)
+    if [ -z "$zone_id" ]; then
+        log_warning "Cloudflare zone not found for $hostname (token lacks access?)"
+        return 1
+    fi
+
+    local list_resp record_ids
+    list_resp=$(curl -sS --max-time 10 -X GET "${CF_API_BASE}/zones/${zone_id}/dns_records?name=${hostname}" \
+        -H "Authorization: Bearer $api_token" \
+        -H "Content-Type: application/json" 2>/dev/null || echo '{}')
+    record_ids=$(echo "$list_resp" | jq -r '.result[].id' 2>/dev/null || echo "")
+
+    if [ -z "$record_ids" ]; then
+        log_warning "No DNS records found for $hostname"
+        return 0
+    fi
+
+    local rid del_resp ok err
+    while IFS= read -r rid; do
+        [ -z "$rid" ] && continue
+        del_resp=$(curl -sS --max-time 10 -X DELETE "${CF_API_BASE}/zones/${zone_id}/dns_records/${rid}" \
+            -H "Authorization: Bearer $api_token" \
+            -H "Content-Type: application/json" 2>/dev/null || echo '{}')
+        ok=$(echo "$del_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+        if [ "$ok" = "true" ]; then
+            log_success "Deleted DNS record $hostname"
+        else
+            err=$(echo "$del_resp" | jq -r '.errors[0].message // "unknown error"' 2>/dev/null || echo "parse error")
+            log_warning "Failed to delete DNS record $hostname: $err"
+        fi
+    done <<< "$record_ids"
+}
+
+# --- Commands ---
 
 cmd_create_user() {
-    local username=$1
+    local username=${1:-}
     if [ -z "$username" ]; then
         log_error "Usage: mcf create user <username>"
         return 1
@@ -131,41 +275,100 @@ cmd_create_user() {
 
     log_info "Creating user '$username'..."
 
-    # Multi-tenancy: cada user tiene su propio cert.pem aislado en $USERS_DIR/<user>/cert.pem.
-    # `cloudflared tunnel login` siempre escribe a ~/.cloudflared/cert.pem (path fijo de cloudflared),
-    # así que: (1) backup del cert.pem global si existe, (2) login, (3) mover el nuevo cert a la
-    # carpeta del user, (4) restaurar el backup. Tras esto ~/.cloudflared/ queda libre para que
-    # el siguiente `mcf create user` no pise la cuenta anterior.
-    if [ -f "$DEFAULT_CLOUDFLARED_DIR/cert.pem" ]; then
+    # cloudflared tunnel login writes to ~/.cloudflared/cert.pem (fixed path).
+    # Backup + restore the global cert so concurrent users don't clobber each other.
+    local global_cert="$DEFAULT_CLOUDFLARED_DIR/cert.pem"
+    if [ -f "$global_cert" ]; then
         log_warning "Backing up existing global cert.pem..."
-        mv "$DEFAULT_CLOUDFLARED_DIR/cert.pem" "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak"
+        mv "$global_cert" "$global_cert.bak"
     fi
 
     log_info "Please log in to Cloudflare in the browser window that appears."
-    cloudflared tunnel login
+    cloudflared tunnel login || true
 
-    if [ -f "$DEFAULT_CLOUDFLARED_DIR/cert.pem" ]; then
+    if [ -f "$global_cert" ]; then
         mkdir -p "$user_dir"
-        mv "$DEFAULT_CLOUDFLARED_DIR/cert.pem" "$user_dir/cert.pem"
-        log_success "User '$username' created successfully!"
+        mv "$global_cert" "$user_dir/cert.pem"
+        chmod 600 "$user_dir/cert.pem"
+        log_success "User '$username' created."
     else
         log_error "Login failed or cert.pem not found."
+        if [ -f "$global_cert.bak" ]; then
+            mv "$global_cert.bak" "$global_cert"
+        fi
+        return 1
     fi
 
-    if [ -f "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak" ]; then
-        mv "$DEFAULT_CLOUDFLARED_DIR/cert.pem.bak" "$DEFAULT_CLOUDFLARED_DIR/cert.pem"
+    if [ -f "$global_cert.bak" ]; then
+        mv "$global_cert.bak" "$global_cert"
     fi
+
+    # Optional API token for DNS record cleanup on `mcf delete`. Interactive only.
+    if [ -t 0 ]; then
+        printf 'Cloudflare API token for %s (optional, Enter to skip): ' "$username"
+        local api_token=""
+        read -r api_token || true
+        if [ -n "$api_token" ]; then
+            printf '%s\n' "$api_token" > "$user_dir/api_token"
+            chmod 600 "$user_dir/api_token"
+            log_success "API token saved."
+        else
+            log_warning "No API token saved. 'mcf delete' will NOT remove DNS records for this user."
+            log_warning "Set later via: mcf set token $username"
+        fi
+    else
+        log_warning "Non-interactive shell; skipping API token prompt."
+        log_warning "Set it later via: mcf set token $username"
+    fi
+}
+
+cmd_set_token() {
+    local sub=${1:-}
+    if [ "$sub" != "token" ]; then
+        log_error "Usage: mcf set token <user>"
+        return 1
+    fi
+    local username=${2:-}
+    if [ -z "$username" ]; then
+        log_error "Usage: mcf set token <user>"
+        return 1
+    fi
+    local user_dir="$USERS_DIR/$username"
+    if [ ! -d "$user_dir" ]; then
+        log_error "User '$username' not found."
+        return 1
+    fi
+    if [ ! -t 0 ]; then
+        log_error "set token requires an interactive TTY (avoids leaving the token in shell history)."
+        return 1
+    fi
+    printf 'Cloudflare API token for %s: ' "$username"
+    local api_token=""
+    read -r api_token || true
+    if [ -z "$api_token" ]; then
+        log_error "Empty token; aborting."
+        return 1
+    fi
+    printf '%s\n' "$api_token" > "$user_dir/api_token"
+    chmod 600 "$user_dir/api_token"
+    log_success "API token updated for $username."
 }
 
 cmd_list_users() {
     log_info "Registered Users:"
-    if [ -d "$USERS_DIR" ]; then
-        ls -1 "$USERS_DIR" | while read -r user; do
-            echo " - $user"
+    if [ -d "$USERS_DIR" ] && [ -n "$(ls -A "$USERS_DIR" 2>/dev/null || true)" ]; then
+        local user_path user marker
+        for user_path in "$USERS_DIR"/*/; do
+            [ -d "$user_path" ] || continue
+            user=$(basename "$user_path")
+            marker=""
+            [ -f "$USERS_DIR/$user/api_token" ] && marker=" [token set]"
+            echo " - $user$marker"
             if [ -f "$USERS_DIR/$user/domains" ]; then
                 echo "   Domains:"
-                while read -r domain; do
-                    echo "     * $domain"
+                local domain
+                while IFS= read -r domain; do
+                    [ -n "$domain" ] && echo "     * $domain"
                 done < "$USERS_DIR/$user/domains"
             fi
         done
@@ -175,26 +378,39 @@ cmd_list_users() {
 }
 
 cmd_add_domain() {
-    shift; local domain=$1; shift;
+    local domain=${1:-}; shift || true
     local username=""
-    while [[ "$#" -gt 0 ]]; do
-        case $1 in --user) username="$2"; shift ;; *) shift ;; esac
+    while [ $# -gt 0 ]; do
+        case ${1:-} in
+            --user) username="${2:-}"; shift 2 ;;
+            *)      shift ;;
+        esac
     done
     if [ -z "$domain" ] || [ -z "$username" ]; then
         log_error "Usage: mcf add domain <domain> --user <username>"
         return 1
     fi
     local user_dir="$USERS_DIR/$username"
-    [ ! -d "$user_dir" ] && { log_error "User not found"; return 1; }
-    echo "$domain" >> "$user_dir/domains"
-    log_success "Domain added."
+    if [ ! -d "$user_dir" ]; then
+        log_error "User '$username' not found."
+        return 1
+    fi
+    if [ -f "$user_dir/domains" ] && grep -Fxq "$domain" "$user_dir/domains"; then
+        log_warning "Domain '$domain' already tracked for $username."
+        return 0
+    fi
+    printf '%s\n' "$domain" >> "$user_dir/domains"
+    log_success "Domain '$domain' added for user '$username'."
 }
 
 cmd_create_tunnel() {
-    local tunnel_name=$1; shift;
+    local tunnel_name=${1:-}; shift || true
     local username=""
-    while [[ "$#" -gt 0 ]]; do
-        case $1 in --user) username="$2"; shift ;; *) shift ;; esac
+    while [ $# -gt 0 ]; do
+        case ${1:-} in
+            --user) username="${2:-}"; shift 2 ;;
+            *)      shift ;;
+        esac
     done
 
     if [ -z "$tunnel_name" ] || [ -z "$username" ]; then
@@ -203,141 +419,215 @@ cmd_create_tunnel() {
     fi
 
     local user_cert="$USERS_DIR/$username/cert.pem"
-    [ ! -f "$user_cert" ] && { log_error "User cert not found"; return 1; }
-    
+    if [ ! -f "$user_cert" ]; then
+        log_error "User cert not found: $user_cert"
+        return 1
+    fi
+
     local tunnel_dir="$TUNNELS_DIR/$tunnel_name"
-    [ -d "$tunnel_dir" ] && { log_error "Tunnel exists"; return 1; }
+    if [ -d "$tunnel_dir" ]; then
+        log_error "Tunnel '$tunnel_name' already exists."
+        return 1
+    fi
 
     log_info "Creating tunnel '$tunnel_name'..."
 
-    # Preparar destino ANTES de invocar cloudflared: con --output json el JSON va a stdout
-    # y cloudflared NO escribe el creds.json a ~/.cloudflared/<UUID>.json por defecto;
-    # hay que pasarle --credentials-file explícitamente para que lo escriba en su sitio final.
     mkdir -p "$tunnel_dir"
     local creds_path="$tunnel_dir/creds.json"
-    # Cleanup defensivo: si quedó un creds.json de un intento previo fallido, cloudflared abortaría
     rm -f "$creds_path"
 
-    local output
-    # cloudflared 2024+: --origincert es flag global del subcomando `tunnel` (va ANTES de `create`).
-    # --output json + --credentials-file son SUBCOMMAND OPTIONS del create (van DESPUÉS).
-    # JSON en stdout para parseo limpio del UUID; creds.json escrito directamente al tunnel_dir.
+    # --origincert is a tunnel-subcommand-level flag (BEFORE `create`).
+    # --output json + --credentials-file are options of `create` (AFTER).
+    local output create_rc=0
     output=$(cloudflared tunnel --origincert "$user_cert" create \
         --output json \
         --credentials-file "$creds_path" \
-        "$tunnel_name" 2>&1)
-    local create_rc=$?
+        "$tunnel_name" 2>&1) || create_rc=$?
 
-    # Parseo robusto vía jq; fallback a regex estricta + head -n1 si cloudflared no devolviera JSON
     local uuid
-    uuid=$(echo "$output" | jq -r '.id' 2>/dev/null)
+    uuid=$(echo "$output" | jq -r '.id' 2>/dev/null || echo "")
     if [ -z "$uuid" ] || [ "$uuid" = "null" ]; then
-        # Fallback legacy: primera UUID válida, head -n1 evita concatenar varias, tr limpia \n y espacios
-        uuid=$(echo "$output" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1 | tr -d '[:space:]')
+        uuid=$(echo "$output" \
+            | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+            | head -n1 \
+            | tr -d '[:space:]' || true)
     fi
 
     if [ "$create_rc" -ne 0 ] || [ -z "$uuid" ]; then
-        log_error "Failed to create tunnel or get UUID."
-        echo "$output"
-        # Limpieza si cloudflared dejó un creds.json a medias o el tunnel_dir vacío
+        log_error "Failed to create tunnel or extract UUID."
+        echo "$output" >&2
         rm -f "$creds_path"
-        rmdir "$tunnel_dir" 2>/dev/null
+        rmdir "$tunnel_dir" 2>/dev/null || true
         return 1
     fi
 
-    # Sanity check: el creds.json debe existir en el path que le dimos
     if [ ! -f "$creds_path" ]; then
         log_error "Tunnel created in Cloudflare but credentials file missing at $creds_path"
-        echo "$output"
+        echo "$output" >&2
         return 1
     fi
 
-    # Save meta — printf %s evita que un valor con \n rompa la línea;
-    # CREATED_AT en ISO (sin espacios) para que `source $meta` no interprete "May" como comando.
-    # CREDS apunta al path final del creds.json (escrito por cloudflared, no movido por nosotros).
-    local id=$(get_next_id)
-    {
-        printf 'UUID=%s\n' "$uuid"
-        printf 'USER=%s\n' "$username"
-        printf 'NAME=%s\n' "$tunnel_name"
-        printf 'ID=%s\n' "$id"
-        printf 'CREDS=%s\n' "$creds_path"
-        printf 'CREATED_AT=%s\n' "$(date -Iseconds)"
-    } > "$tunnel_dir/meta"
+    local id
+    id=$(get_next_id)
+    local meta="$tunnel_dir/meta"
+    jq -n \
+        --arg uuid "$uuid" \
+        --arg user "$username" \
+        --arg name "$tunnel_name" \
+        --arg id "$id" \
+        --arg creds "$creds_path" \
+        --arg created_at "$(date -Iseconds)" \
+        '{uuid:$uuid, user:$user, name:$name, id:$id, creds:$creds, created_at:$created_at, hostnames:[]}' \
+        > "$meta"
 
-    # Add to DB
-    add_to_db "$id" "$tunnel_name" "$username"
+    log_success "Tunnel '$tunnel_name' created (ID: $id, UUID: $uuid)"
+}
 
-    log_success "Tunnel created with ID $id"
+cmd_route_tunnel() {
+    local input=${1:-}
+    local hostname=${2:-}
+    if [ -z "$input" ] || [ -z "$hostname" ]; then
+        log_error "Usage: mcf route <id|name> <hostname>"
+        return 1
+    fi
+
+    local tunnel_name
+    tunnel_name=$(resolve_tunnel_name "$input" || true)
+    if [ -z "$tunnel_name" ]; then
+        log_error "Tunnel '$input' does not exist."
+        return 1
+    fi
+
+    local tunnel_dir="$TUNNELS_DIR/$tunnel_name"
+    local meta="$tunnel_dir/meta"
+    if [ ! -f "$meta" ]; then
+        log_error "Tunnel meta missing: $meta"
+        return 1
+    fi
+
+    local user uuid
+    user=$(meta_get "$meta" "user")
+    uuid=$(meta_get "$meta" "uuid")
+    if [ -z "$user" ] || [ -z "$uuid" ]; then
+        log_error "Tunnel meta is incomplete (missing user/uuid)."
+        return 1
+    fi
+    local user_cert="$USERS_DIR/$user/cert.pem"
+    if [ ! -f "$user_cert" ]; then
+        log_error "User cert missing for owner '$user': $user_cert"
+        return 1
+    fi
+
+    # --origincert avoids the racy global cert swap that 1.1.x used.
+    local ret=0
+    cloudflared tunnel --origincert "$user_cert" route dns "$uuid" "$hostname" || ret=$?
+    if [ $ret -ne 0 ]; then
+        log_error "Failed to route DNS for $hostname"
+        return $ret
+    fi
+
+    meta_add_to_array "$meta" "hostnames" "$hostname"
+    log_success "Routed $hostname -> $tunnel_name"
 }
 
 cmd_start_tunnel() {
-    local input=$1
-    local target=$2
-    
+    local input=${1:-}
+    local target=${2:-}
+
     if [ -z "$input" ]; then
         log_error "Usage: mcf start <id|name> [url|port]"
         return 1
     fi
 
-    local tunnel_name=$(get_tunnel_by_id_or_name "$input")
-    if [ -z "$tunnel_name" ]; then log_error "Tunnel not found"; return 1; fi
-    
+    local tunnel_name
+    tunnel_name=$(resolve_tunnel_name "$input" || true)
+    if [ -z "$tunnel_name" ]; then
+        log_error "Tunnel '$input' does not exist."
+        return 1
+    fi
+
     local tunnel_dir="$TUNNELS_DIR/$tunnel_name"
-    
-    # Handle target
+    local meta="$tunnel_dir/meta"
+    local creds="$tunnel_dir/creds.json"
+
+    [ -f "$meta" ]  || { log_error "Meta file not found: $meta";          return 1; }
+    [ -f "$creds" ] || { log_error "Credentials file not found: $creds";  return 1; }
+
+    local user uuid id
+    user=$(meta_get "$meta" "user")
+    uuid=$(meta_get "$meta" "uuid")
+    id=$(meta_get "$meta" "id")
+    if [ -z "$user" ] || [ -z "$uuid" ]; then
+        log_error "Tunnel meta is incomplete (missing user/uuid)."
+        return 1
+    fi
+    local user_cert="$USERS_DIR/$user/cert.pem"
+    [ -f "$user_cert" ] || { log_error "User cert missing for owner '$user': $user_cert"; return 1; }
+
     local url=""
     if [[ "$target" =~ ^[0-9]+$ ]]; then
         url="http://localhost:$target"
     elif [[ "$target" == http* ]]; then
         url="$target"
     elif [ -z "$target" ]; then
-        # Try to read last URL from meta
-        if [ -f "$tunnel_dir/meta" ]; then
-             url=$(grep "^URL=" "$tunnel_dir/meta" | cut -d= -f2)
-        fi
+        url=$(meta_get "$meta" "url")
     fi
-    
     if [ -z "$url" ]; then
-        log_error "No URL/Port provided and no history found."
+        log_error "No URL/port provided and no previous URL stored in meta."
         return 1
     fi
 
-    if [ -f "$tunnel_dir/pid" ]; then
-        local pid=$(cat "$tunnel_dir/pid")
-        if ps -p "$pid" > /dev/null; then
-            log_error "Already running (PID: $pid)"
-            return 1
-        else
-            rm "$tunnel_dir/pid"
-        fi
+    if is_running "$tunnel_dir"; then
+        local existing_pid
+        existing_pid=$(cat "$tunnel_dir/pid")
+        log_error "Tunnel '$tunnel_name' already running (PID: $existing_pid)."
+        return 1
     fi
-    
-    source "$tunnel_dir/meta"
-    
-    nohup cloudflared tunnel run --url "$url" --credentials-file "$tunnel_dir/creds.json" "$UUID" > "$LOGS_DIR/$tunnel_name.log" 2>&1 &
+    rm -f "$tunnel_dir/pid"
+
+    # Always override any inherited TUNNEL_ORIGIN_CERT so child cloudflared uses THIS user's cert,
+    # never whatever the parent shell happened to export.
+    export TUNNEL_ORIGIN_CERT="$user_cert"
+
+    local log_file="$LOGS_DIR/$tunnel_name.log"
+    nohup cloudflared tunnel run --url "$url" --credentials-file "$creds" "$uuid" \
+        > "$log_file" 2>&1 &
     local pid=$!
     echo "$pid" > "$tunnel_dir/pid"
-    
-    # Update URL in meta
-    # Remove old URL line
-    grep -v "^URL=" "$tunnel_dir/meta" > "$tunnel_dir/meta.tmp"
-    mv "$tunnel_dir/meta.tmp" "$tunnel_dir/meta"
-    echo "URL=$url" >> "$tunnel_dir/meta"
-    
-    log_success "Started tunnel '$tunnel_name' (ID: $ID) -> $url"
+
+    # Confirm the process didn't die immediately (bad cert, port in use, bad UUID, ...).
+    sleep 1
+    if ! ps -p "$pid" > /dev/null 2>&1; then
+        rm -f "$tunnel_dir/pid"
+        log_error "Tunnel '$tunnel_name' failed to start. Last log lines:"
+        tail -n 15 "$log_file" 2>/dev/null || true
+        return 1
+    fi
+
+    meta_set "$meta" "url" "$url"
+    log_success "Started tunnel '$tunnel_name' (ID: ${id:-?}, PID: $pid) -> $url"
 }
 
 cmd_stop_tunnel() {
-    local input=$1
-    local tunnel_name=$(get_tunnel_by_id_or_name "$input")
-    [ -z "$tunnel_name" ] && { log_error "Tunnel not found"; return 1; }
-    
+    local input=${1:-}
+    if [ -z "$input" ]; then
+        log_error "Usage: mcf stop <id|name>"
+        return 1
+    fi
+    local tunnel_name
+    tunnel_name=$(resolve_tunnel_name "$input" || true)
+    if [ -z "$tunnel_name" ]; then
+        log_error "Tunnel '$input' does not exist."
+        return 1
+    fi
     local tunnel_dir="$TUNNELS_DIR/$tunnel_name"
     if [ -f "$tunnel_dir/pid" ]; then
-        local pid=$(cat "$tunnel_dir/pid")
-        kill "$pid" 2>/dev/null
-        rm "$tunnel_dir/pid"
+        local pid
+        pid=$(cat "$tunnel_dir/pid" 2>/dev/null || echo "")
+        if [[ "$pid" =~ ^[0-9]+$ ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$tunnel_dir/pid"
         log_success "Stopped $tunnel_name"
     else
         log_warning "Not running"
@@ -345,148 +635,214 @@ cmd_stop_tunnel() {
 }
 
 cmd_restart_tunnel() {
-    local input=$1
-    cmd_stop_tunnel "$input"
+    local input=${1:-}
+    cmd_stop_tunnel "$input" || true
     sleep 1
     cmd_start_tunnel "$input"
 }
 
 cmd_delete_tunnel() {
-    local input=$1
-    local tunnel_name=$(get_tunnel_by_id_or_name "$input")
-    [ -z "$tunnel_name" ] && { log_error "Tunnel not found"; return 1; }
-    
+    local input=${1:-}
+    if [ -z "$input" ]; then
+        log_error "Usage: mcf delete <id|name>"
+        return 1
+    fi
+    local tunnel_name
+    tunnel_name=$(resolve_tunnel_name "$input" || true)
+    if [ -z "$tunnel_name" ]; then
+        log_error "Tunnel '$input' does not exist."
+        return 1
+    fi
     local tunnel_dir="$TUNNELS_DIR/$tunnel_name"
-    
-    # Check ID
-    local id=$(get_id_by_name "$tunnel_name")
-    
-    cmd_stop_tunnel "$input" > /dev/null 2>&1
-    
-    if [ -f "$tunnel_dir/meta" ]; then
-         local uuid=$(grep "^UUID=" "$tunnel_dir/meta" | cut -d= -f2)
-         # Cleanup cloudflare side? skipping for safety or speed
-         # Ideally we should clean up if cert is available
+    local meta="$tunnel_dir/meta"
+
+    cmd_stop_tunnel "$tunnel_name" > /dev/null 2>&1 || true
+
+    local user="" uuid=""
+    if [ -f "$meta" ]; then
+        user=$(meta_get "$meta" "user")
+        uuid=$(meta_get "$meta" "uuid")
+    fi
+
+    if [ -n "$uuid" ] && [ -n "$user" ]; then
+        local user_cert="$USERS_DIR/$user/cert.pem"
+        if [ -f "$user_cert" ]; then
+            log_info "Cleaning up tunnel connections (cloudflared cleanup)..."
+            cloudflared tunnel --origincert "$user_cert" cleanup "$uuid" \
+                || log_warning "cloudflared cleanup failed (continuing)."
+            log_info "Deleting tunnel from Cloudflare..."
+            if cloudflared tunnel --origincert "$user_cert" delete -f "$uuid"; then
+                log_success "Tunnel deleted from Cloudflare."
+            else
+                log_warning "cloudflared delete failed (continuing with local cleanup)."
+            fi
+        else
+            log_warning "User cert missing for '$user'; skipping remote tunnel deletion."
+        fi
+
+        local api_token hostnames
+        api_token=$(read_user_api_token "$user")
+        hostnames=$(meta_get_array "$meta" "hostnames")
+        if [ -n "$hostnames" ]; then
+            local hn
+            while IFS= read -r hn; do
+                [ -z "$hn" ] && continue
+                cf_delete_dns_record "$api_token" "$hn" || true
+            done <<< "$hostnames"
+        fi
+    else
+        log_warning "Meta missing or incomplete; skipping remote cleanup."
     fi
 
     rm -rf "$tunnel_dir"
-    remove_from_db "$id"
     log_success "Deleted tunnel $tunnel_name"
 }
 
 cmd_logs() {
-    local input=$1
-    shift
+    local input=${1:-}
+    shift || true
     local lines=20
-    while [[ "$#" -gt 0 ]]; do
-        case $1 in --lines) lines="$2"; shift ;; *) shift ;; esac
+    while [ $# -gt 0 ]; do
+        case ${1:-} in
+            --lines) lines="${2:-20}"; shift 2 ;;
+            *)       shift ;;
+        esac
     done
-    
-    local tunnel_name=$(get_tunnel_by_id_or_name "$input")
-    [ -z "$tunnel_name" ] && { log_error "Tunnel not found"; return 1; }
-    
+    if [ -z "$input" ]; then
+        log_error "Usage: mcf logs <id|name> [--lines N]"
+        return 1
+    fi
+    local tunnel_name
+    tunnel_name=$(resolve_tunnel_name "$input" || true)
+    if [ -z "$tunnel_name" ]; then
+        log_error "Tunnel '$input' does not exist."
+        return 1
+    fi
     local log_file="$LOGS_DIR/$tunnel_name.log"
     if [ -f "$log_file" ]; then
         tail -n "$lines" -f "$log_file"
     else
-        log_error "No logs found for $tunnel_name"
-    fi
-}
-
-cmd_route_tunnel() {
-    local input=$1
-    local hostname=$2
-    local tunnel_name=$(get_tunnel_by_id_or_name "$input")
-    [ -z "$tunnel_name" ] && { log_error "Tunnel not found"; return 1; }
-    
-    local tunnel_dir="$TUNNELS_DIR/$tunnel_name"
-    local user=$(grep "^USER=" "$tunnel_dir/meta" | cut -d= -f2)
-    local uuid=$(grep "^UUID=" "$tunnel_dir/meta" | cut -d= -f2)
-    local user_cert="$USERS_DIR/$user/cert.pem"
-    
-    [ ! -f "$user_cert" ] && { log_error "User cert missing"; return 1; }
-
-    # Multi-tenant safe: usar --origincert con el cert del USUARIO del túnel (no el global).
-    # Antes copiábamos el cert al ~/.cloudflared/cert.pem global y lo restaurábamos — racy
-    # entre comandos concurrentes y dejaba estado global pisado si fallaba el restore.
-    # --origincert va ANTES del subsubcomando `route` (flag global del subcomando tunnel).
-    cloudflared tunnel --origincert "$user_cert" route dns "$uuid" "$hostname"
-    local ret=$?
-
-
-    if [ $ret -eq 0 ]; then
-        # Acumular hostnames como lista CSV en una sola línea HOSTNAME=...
-        # (antes sobreescribía, así `mcf list` solo mostraba el último route)
-        local existing_hostnames
-        existing_hostnames=$(grep "^HOSTNAME=" "$tunnel_dir/meta" | cut -d= -f2-)
-        local new_hostnames
-        if [ -z "$existing_hostnames" ]; then
-            new_hostnames="$hostname"
-        elif [[ ",$existing_hostnames," == *",$hostname,"* ]]; then
-            # Ya está en la lista, no duplicar
-            new_hostnames="$existing_hostnames"
-        else
-            new_hostnames="$existing_hostnames,$hostname"
-        fi
-        grep -v "^HOSTNAME=" "$tunnel_dir/meta" > "$tunnel_dir/meta.tmp"
-        mv "$tunnel_dir/meta.tmp" "$tunnel_dir/meta"
-        printf 'HOSTNAME=%s\n' "$new_hostnames" >> "$tunnel_dir/meta"
-        log_success "Routed $hostname -> $tunnel_name"
-    else
-        log_error "Failed to route"
+        log_error "No logs for $tunnel_name"
+        return 1
     fi
 }
 
 cmd_list_tunnels() {
-    printf "${CYAN}%-4s %-15s %-15s %-10s %-8s %-25s %-20s${NC}\n" "ID" "NAME" "USER" "STATUS" "PID" "HOSTNAME" "LOCAL"
+    printf '%s%-4s %-15s %-15s %-9s %-8s %-25s %-20s%s\n' \
+        "$CYAN" "ID" "NAME" "USER" "STATUS" "PID" "HOSTNAMES" "LOCAL" "$NC"
     echo "-------------------------------------------------------------------------------------------------------"
-    
-    if [ -f "$DB_FILE" ]; then
-        while IFS='|' read -r id name user; do
-            local tunnel_dir="$TUNNELS_DIR/$name"
-            if [ -d "$tunnel_dir" ]; then
-                local status="${RED}STOPPED${NC}"
-                local pid="-"
-                local hostname="-"
-                local url="-"
-                
-                if [ -f "$tunnel_dir/meta" ]; then
-                    hostname=$(grep "^HOSTNAME=" "$tunnel_dir/meta" | cut -d= -f2)
-                    url=$(grep "^URL=" "$tunnel_dir/meta" | cut -d= -f2)
-                fi
-                [ -z "$hostname" ] && hostname="-"
-                [ -z "$url" ] && url="-"
 
-                if [ -f "$tunnel_dir/pid" ]; then
-                    local p=$(cat "$tunnel_dir/pid")
-                    if ps -p "$p" > /dev/null; then
-                        status="${GREEN}ONLINE${NC}"
-                        pid=$p
-                    else
-                        status="${RED}ERR${NC}"
-                    fi
-                fi
-                
-                printf "%-4s %-15s %-15s %-19s %-8s %-25s %-20s\n" "$id" "$name" "$user" "$status" "$pid" "$hostname" "$url"
-            fi
-        done < "$DB_FILE"
-    else
+    if [ ! -d "$TUNNELS_DIR" ]; then
         echo "No tunnels found."
+        return 0
     fi
+
+    # Sort tunnels by numeric id; ids missing/garbage sort first so they're visible.
+    local sorted
+    sorted=$(for meta in "$TUNNELS_DIR"/*/meta; do
+        [ -f "$meta" ] || continue
+        printf '%s\t%s\n' "$(meta_get "$meta" "id")" "$meta"
+    done | sort -n -k1,1 || true)
+
+    if [ -z "$sorted" ]; then
+        echo "No tunnels found."
+        return 0
+    fi
+
+    local id meta name user url hostnames pid status_kind status_text status_color tunnel_dir p
+    while IFS=$'\t' read -r id meta; do
+        [ -f "$meta" ] || continue
+        name=$(basename "$(dirname "$meta")")
+        user=$(meta_get "$meta" "user")
+        url=$(meta_get "$meta" "url")
+        hostnames=$(meta_get_array "$meta" "hostnames" | paste -sd, - 2>/dev/null || true)
+        [ -z "$user" ]      && user="?"
+        [ -z "$url" ]       && url="-"
+        [ -z "$hostnames" ] && hostnames="-"
+        [ -z "$id" ]        && id="?"
+
+        tunnel_dir="$TUNNELS_DIR/$name"
+        pid="-"
+        status_kind="stopped"
+        if [ -f "$tunnel_dir/pid" ]; then
+            p=$(cat "$tunnel_dir/pid" 2>/dev/null || echo "")
+            if [[ "$p" =~ ^[0-9]+$ ]] && ps -p "$p" > /dev/null 2>&1; then
+                status_kind="online"
+                pid="$p"
+            else
+                status_kind="err"
+            fi
+        fi
+        case "$status_kind" in
+            online)  status_text="ONLINE";  status_color="$GREEN" ;;
+            err)     status_text="ERR";     status_color="$RED"   ;;
+            stopped) status_text="STOPPED"; status_color="$RED"   ;;
+        esac
+
+        printf '%-4s %-15s %-15s ' "$id" "$name" "$user"
+        printf '%s%-9s%s'          "$status_color" "$status_text" "$NC"
+        printf ' %-8s %-25s %-20s\n' "$pid" "$hostnames" "$url"
+    done <<< "$sorted"
+}
+
+cmd_purge_user() {
+    local sub=${1:-}
+    if [ "$sub" != "user" ]; then
+        log_error "Usage: mcf purge user <name>"
+        return 1
+    fi
+    local username=${2:-}
+    if [ -z "$username" ]; then
+        log_error "Usage: mcf purge user <name>"
+        return 1
+    fi
+    local user_dir="$USERS_DIR/$username"
+    if [ ! -d "$user_dir" ]; then
+        log_error "User '$username' not found."
+        return 1
+    fi
+
+    log_warning "This will delete ALL tunnels owned by '$username', their DNS records, and the user itself."
+    if [ -t 0 ]; then
+        printf 'Type the username to confirm: '
+        local confirm=""
+        read -r confirm || true
+        if [ "$confirm" != "$username" ]; then
+            log_error "Confirmation mismatch; aborted."
+            return 1
+        fi
+    else
+        log_error "purge user requires interactive confirmation."
+        return 1
+    fi
+
+    local meta name owner
+    for meta in "$TUNNELS_DIR"/*/meta; do
+        [ -f "$meta" ] || continue
+        owner=$(meta_get "$meta" "user")
+        if [ "$owner" = "$username" ]; then
+            name=$(basename "$(dirname "$meta")")
+            log_info "Purging tunnel: $name"
+            cmd_delete_tunnel "$name" || log_warning "Failed to fully delete $name (continuing)"
+        fi
+    done
+
+    rm -rf "$user_dir"
+    log_success "User '$username' purged."
 }
 
 cmd_save() {
-    # Dump currently running tunnels to a file
-    log_info "Saving current process list..."
-    > "$DUMP_FILE"
-    if [ -f "$DB_FILE" ]; then
-        while IFS='|' read -r id name user; do
-            local tunnel_dir="$TUNNELS_DIR/$name"
-            if [ -f "$tunnel_dir/pid" ] && ps -p $(cat "$tunnel_dir/pid") >/dev/null; then
-                # It is running
-                echo "$name" >> "$DUMP_FILE"
+    log_info "Saving running tunnels..."
+    : > "$DUMP_FILE"
+    if [ -d "$TUNNELS_DIR" ]; then
+        local tunnel_dir name
+        for tunnel_dir in "$TUNNELS_DIR"/*/; do
+            [ -d "$tunnel_dir" ] || continue
+            if is_running "$tunnel_dir"; then
+                name=$(basename "$tunnel_dir")
+                printf '%s\n' "$name" >> "$DUMP_FILE"
             fi
-        done < "$DB_FILE"
+        done
     fi
     log_success "Saved running tunnels to $DUMP_FILE"
 }
@@ -494,26 +850,26 @@ cmd_save() {
 cmd_resurrect() {
     log_info "Resurrecting tunnels..."
     if [ -f "$DUMP_FILE" ]; then
-        while read -r name; do
+        local name
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
             log_info "Starting $name..."
-            cmd_start_tunnel "$name" ""
+            cmd_start_tunnel "$name" || log_warning "Failed to start $name"
         done < "$DUMP_FILE"
     else
         log_error "No save dump found."
+        return 1
     fi
 }
 
 cmd_startup() {
-    # Create systemd service
     local service_file="/etc/systemd/system/mcf.service"
-    local mcf_path=$(realpath "$0")
-    
+    local mcf_path
+    mcf_path=$(realpath "$0")
+
     log_info "Generating systemd service..."
-    
-    # Need sudo for this
-    if [ "$EUID" -ne 0 ]; then 
-        log_warning "Root privileges needed to setup startup service. Running sudo..."
-        sudo bash -c "cat > $service_file" <<EOF
+    local svc_content
+    svc_content=$(cat <<EOF
 [Unit]
 Description=Multi-Cloudflared Manager
 After=network.target
@@ -527,66 +883,105 @@ Environment=HOME=$HOME
 [Install]
 WantedBy=multi-user.target
 EOF
+)
+
+    if [ "$EUID" -ne 0 ]; then
+        log_warning "Root privileges needed; using sudo..."
+        echo "$svc_content" | sudo tee "$service_file" > /dev/null
         sudo systemctl daemon-reload
         sudo systemctl enable mcf
-        log_success "Startup service enabled."
-        echo "You can now use 'mcf save' to freeze the process list."
     else
-        cat > "$service_file" <<EOF
-[Unit]
-Description=Multi-Cloudflared Manager
-After=network.target
-
-[Service]
-Type=forking
-User=$USER
-ExecStart=$mcf_path resurrect
-Environment=HOME=$HOME
-
-[Install]
-WantedBy=multi-user.target
-EOF
+        echo "$svc_content" > "$service_file"
         systemctl daemon-reload
         systemctl enable mcf
-        log_success "Startup service enabled."
     fi
+    log_success "Startup service enabled."
+    echo "You can now use 'mcf save' to freeze the process list."
 }
 
-# Main Dispatcher
+show_help() {
+    show_banner
+    cat <<'EOF'
+Commands:
+  create user <name>              Create a Cloudflare account user (login + optional API token)
+  create tunnel <name> --user U   Create a tunnel for user U
+  list                            Show all tunnels (status table)
+  list users                      Show registered users
+  start <id|name> [port|url]      Start tunnel (port shorthand or full URL)
+  stop <id|name>                  Stop tunnel
+  restart <id|name>               Restart tunnel
+  delete <id|name>                Delete tunnel locally AND in Cloudflare (+ DNS records if token set)
+  logs <id|name> [--lines N]      Tail tunnel logs (default 20 lines)
+  route <id|name> <hostname>      Route DNS hostname to tunnel (CNAME)
+  add domain <domain> --user U    Track a domain under a user (informational)
+  set token <user>                Set / update Cloudflare API token for user
+  purge user <name>               Delete every tunnel of a user, their DNS records, and the user
+  save                            Snapshot currently-running tunnels for boot resurrection
+  resurrect                       Start tunnels from the last save snapshot
+  startup                         Install systemd unit that runs `resurrect` on boot
+  help                            Show this help
+EOF
+}
+
+# --- Main Dispatcher ---
+
 init_dirs
 
-case "$1" in
-    setup) check_deps; log_success "Ready." ;;
-    create) shift; 
-        if [ "$1" == "user" ]; then shift; cmd_create_user "$@"
-        elif [ "$1" == "tunnel" ]; then shift; cmd_create_tunnel "$@"
-        fi ;;
-    add) shift; [ "$1" == "domain" ] && { shift; cmd_add_domain "$@"; } ;;
-    route) shift; cmd_route_tunnel "$@" ;;
-    list) shift; 
-        if [ "$1" == "users" ]; then cmd_list_users
-        else cmd_list_tunnels
-        fi ;;
-    start) shift; cmd_start_tunnel "$@" ;;
-    stop) shift; cmd_stop_tunnel "$@" ;;
-    restart) shift; cmd_restart_tunnel "$@" ;;
-    delete) shift; cmd_delete_tunnel "$@" ;;
-    logs) shift; cmd_logs "$@" ;;
-    save) cmd_save ;;
+sub=""
+case "${1:-help}" in
+    setup)
+        check_deps
+        log_success "Ready."
+        ;;
+    create)
+        shift
+        sub=${1:-}
+        if [ "$sub" = "user" ]; then
+            shift; cmd_create_user "$@"
+        elif [ "$sub" = "tunnel" ]; then
+            shift; cmd_create_tunnel "$@"
+        else
+            log_error "Usage: mcf create {user|tunnel} ..."
+            exit 1
+        fi
+        ;;
+    add)
+        shift
+        sub=${1:-}
+        if [ "$sub" = "domain" ]; then
+            shift; cmd_add_domain "$@"
+        else
+            log_error "Usage: mcf add domain <domain> --user <user>"
+            exit 1
+        fi
+        ;;
+    set)
+        shift; cmd_set_token "$@"
+        ;;
+    purge)
+        shift; cmd_purge_user "$@"
+        ;;
+    route)
+        shift; cmd_route_tunnel "$@"
+        ;;
+    list)
+        shift
+        sub=${1:-}
+        if [ "$sub" = "users" ]; then
+            cmd_list_users
+        else
+            cmd_list_tunnels
+        fi
+        ;;
+    start)     shift; cmd_start_tunnel "$@" ;;
+    stop)      shift; cmd_stop_tunnel "$@" ;;
+    restart)   shift; cmd_restart_tunnel "$@" ;;
+    delete)    shift; cmd_delete_tunnel "$@" ;;
+    logs)      shift; cmd_logs "$@" ;;
+    save)      cmd_save ;;
     resurrect) cmd_resurrect ;;
-    startup) cmd_startup ;;
-    help|--help|-h|*) 
-        show_banner
-        echo "Commands:"
-        echo "  create user <name>         Add account"
-        echo "  create tunnel <name> ...   Add tunnel"
-        echo "  list                       Show status table"
-        echo "  start <id|name> [port]     Start tunnel"
-        echo "  stop <id|name>             Stop tunnel"
-        echo "  restart <id|name>          Restart tunnel"
-        echo "  logs <id|name>             Tail logs"
-        echo "  route <id|name> <host>     Route DNS"
-        echo "  save                       Save running list"
-        echo "  startup                    Enable boot start"
+    startup)   cmd_startup ;;
+    help|--help|-h|*)
+        show_help
         ;;
 esac
