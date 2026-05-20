@@ -178,13 +178,7 @@ Build a `.deb` package to install this tool easily on other servers:
 ./build.sh
 ```
 
-*Creates `mcf_1.2.0_all.deb`, install via `sudo dpkg -i mcf_1.2.0_all.deb`.*
-
-## Migrating from 1.1.x
-
-`mcf` 1.2.0 stores per-tunnel meta as JSON instead of `KEY=value`. Existing meta files are auto-migrated to JSON the first time the new `mcf` touches them, so no manual migration is required for tunnels you created with 1.1.x.
-
-If you created tunnels on **1.1.2 or earlier** (before the credentials-file fix), those tunnels lack a working `creds.json` and must be deleted and recreated.
+*Creates `mcf_1.2.1_all.deb`, install via `sudo dpkg -i mcf_1.2.1_all.deb`.*
 
 ## Directory Structure
 
@@ -202,3 +196,14 @@ Data is stored in `~/.multi-cloudflared/`:
 ## License
 
 MIT
+
+## Changelog
+
+### 1.2.1
+
+- **Dropped legacy meta migration.** Per-tunnel meta is now assumed to be JSON; a non-JSON meta is a hard, loud error instead of being silently rewritten.
+- **Hardened `set -euo pipefail` behaviour.** Internal `meta_*` reads are guarded so a single corrupted meta no longer aborts the whole run.
+- **Faster bad-token feedback.** `delete`/DNS cleanup now detects a rejected Cloudflare token on the first API call (e.g. code 6003) and reports the exact code/message plus the `mcf set token <user>` fix, instead of uselessly walking the FQDN.
+- **`sudo mcf startup` now works.** The systemd unit is generated for the invoking user (`$SUDO_USER`) and their real home, not root's.
+- **Identifier validation.** `create user` / `create tunnel` reject names that aren't `[a-zA-Z0-9_-]+` before any directory is created.
+- **Cleaner `delete`.** The tunnel's orphaned `logs/<name>.log` is removed along with its directory.

@@ -3,7 +3,7 @@
 # Build script for Multi-Cloudflared Manager (mcf)
 # Usage: ./build.sh
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 SCRIPT_NAME="mcf"
 BUILD_DIR="build_artifact"
 DEB_NAME="mcf_${VERSION}_all.deb"

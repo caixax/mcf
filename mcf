@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 BASE_DIR="$HOME/.multi-cloudflared"
 USERS_DIR="$BASE_DIR/users"
 TUNNELS_DIR="$BASE_DIR/tunnels"
@@ -60,41 +60,24 @@ EOF
     echo "---------------------------------"
 }
 
-# --- Meta helpers (JSON via jq, with on-demand legacy KEY=value migration) ---
+# --- Meta helpers (JSON via jq) ---
 
-meta_ensure_json() {
+# Meta is always JSON. A non-JSON meta is a hard error: we refuse to guess at
+# its contents and never rewrite it. Callers must guard meta_* invocations
+# (|| true / if) so one corrupted file doesn't abort the whole run under set -e.
+meta_assert_json() {
     local meta_file=$1
-    [ -f "$meta_file" ] || return 0
-    if jq -e 'type=="object"' "$meta_file" >/dev/null 2>&1; then
-        return 0
+    if ! jq -e 'type=="object"' "$meta_file" >/dev/null 2>&1; then
+        log_error "Tunnel meta is corrupted or not JSON: $meta_file"
+        return 1
     fi
-    # Legacy KEY=value → JSON. HOSTNAME (csv) becomes hostnames[]; everything else
-    # becomes a lowercased string key. Done file-locally so we never lose data.
-    local tmp tmp2 line key value lkey
-    tmp=$(mktemp)
-    echo '{}' > "$tmp"
-    while IFS= read -r line || [ -n "$line" ]; do
-        [ -z "$line" ] && continue
-        key="${line%%=*}"
-        value="${line#*=}"
-        [ -z "$key" ] && continue
-        lkey=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
-        tmp2=$(mktemp)
-        if [ "$lkey" = "hostname" ]; then
-            jq --arg v "$value" '.hostnames = ($v | split(",") | map(select(. != "")))' "$tmp" > "$tmp2"
-        else
-            jq --arg k "$lkey" --arg v "$value" '.[$k] = $v' "$tmp" > "$tmp2"
-        fi
-        mv "$tmp2" "$tmp"
-    done < "$meta_file"
-    mv "$tmp" "$meta_file"
 }
 
 meta_get() {
     local meta_file=$1
     local key=$2
     [ -f "$meta_file" ] || return 0
-    meta_ensure_json "$meta_file"
+    meta_assert_json "$meta_file" || return 1
     jq -r --arg k "$key" '.[$k] // empty' "$meta_file" 2>/dev/null || true
 }
 
@@ -102,7 +85,7 @@ meta_get_array() {
     local meta_file=$1
     local key=$2
     [ -f "$meta_file" ] || return 0
-    meta_ensure_json "$meta_file"
+    meta_assert_json "$meta_file" || return 1
     jq -r --arg k "$key" '(.[$k] // [])[]' "$meta_file" 2>/dev/null || true
 }
 
@@ -113,7 +96,7 @@ meta_set() {
     local tmp
     tmp=$(mktemp)
     if [ -f "$meta_file" ]; then
-        meta_ensure_json "$meta_file"
+        meta_assert_json "$meta_file" || { rm -f "$tmp"; return 1; }
         jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$meta_file" > "$tmp"
     else
         jq -n --arg k "$key" --arg v "$value" '{($k): $v}' > "$tmp"
@@ -128,7 +111,7 @@ meta_add_to_array() {
     local tmp
     tmp=$(mktemp)
     if [ -f "$meta_file" ]; then
-        meta_ensure_json "$meta_file"
+        meta_assert_json "$meta_file" || { rm -f "$tmp"; return 1; }
         jq --arg k "$key" --arg v "$value" \
            '.[$k] = ((.[$k] // []) + [$v] | unique)' "$meta_file" > "$tmp"
     else
@@ -154,7 +137,7 @@ get_next_id() {
     if [ -d "$TUNNELS_DIR" ]; then
         for meta in "$TUNNELS_DIR"/*/meta; do
             [ -f "$meta" ] || continue
-            id=$(meta_get "$meta" "id")
+            id=$(meta_get "$meta" "id") || true
             if [[ "$id" =~ ^[0-9]+$ ]] && [ "$id" -gt "$max_id" ]; then
                 max_id=$id
             fi
@@ -169,7 +152,7 @@ resolve_tunnel_name() {
         local meta id
         for meta in "$TUNNELS_DIR"/*/meta; do
             [ -f "$meta" ] || continue
-            id=$(meta_get "$meta" "id")
+            id=$(meta_get "$meta" "id") || true
             if [ "$id" = "$input" ]; then
                 basename "$(dirname "$meta")"
                 return 0
@@ -191,17 +174,43 @@ read_user_api_token() {
     fi
 }
 
+# Names become directory names; block anything that isn't a safe slug before we
+# touch the filesystem.
+validate_identifier() {
+    local kind=$1
+    local value=$2
+    if [[ ! "$value" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        log_error "$kind must match [a-zA-Z0-9_-]+ (got: '$value')"
+        return 1
+    fi
+}
+
 # --- Cloudflare API helpers (DNS record cleanup on delete) ---
 
 cf_find_zone_id() {
     local api_token=$1
     local hostname=$2
-    local zone_name="$hostname" resp zone_id
+    local user=$3
+    local zone_name="$hostname" resp success zone_id code message
+    local first=1
     # Walk up the FQDN until Cloudflare recognises a zone the token has access to.
     while true; do
         resp=$(curl -sS --max-time 10 -X GET "${CF_API_BASE}/zones?name=${zone_name}" \
             -H "Authorization: Bearer $api_token" \
             -H "Content-Type: application/json" 2>/dev/null || echo '{}')
+        # On the very first request, distinguish "token rejected" (success=false,
+        # e.g. code 6003) from "valid token, just no matching zone" (success=true,
+        # empty result). Only the latter is worth walking the FQDN up for.
+        if [ "$first" -eq 1 ]; then
+            success=$(echo "$resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+            if [ "$success" != "true" ]; then
+                code=$(echo "$resp" | jq -r '.errors[0].code // "unknown"' 2>/dev/null || echo "unknown")
+                message=$(echo "$resp" | jq -r '.errors[0].message // "unknown error"' 2>/dev/null || echo "unknown error")
+                log_error "Cloudflare API rejected token for user '$user': code $code — $message. Update with: mcf set token $user"
+                return 1
+            fi
+            first=0
+        fi
         zone_id=$(echo "$resp" | jq -r '.result[0].id // empty' 2>/dev/null || echo "")
         if [ -n "$zone_id" ]; then
             echo "$zone_id"
@@ -218,6 +227,7 @@ cf_find_zone_id() {
 cf_delete_dns_record() {
     local api_token=$1
     local hostname=$2
+    local user=$3
 
     if [ -z "$api_token" ]; then
         log_warning "No API token for this user; skipping DNS cleanup for $hostname"
@@ -225,7 +235,7 @@ cf_delete_dns_record() {
     fi
 
     local zone_id
-    zone_id=$(cf_find_zone_id "$api_token" "$hostname" || true)
+    zone_id=$(cf_find_zone_id "$api_token" "$hostname" "$user" || true)
     if [ -z "$zone_id" ]; then
         log_warning "Cloudflare zone not found for $hostname (token lacks access?)"
         return 1
@@ -266,6 +276,7 @@ cmd_create_user() {
         log_error "Usage: mcf create user <username>"
         return 1
     fi
+    validate_identifier "Username" "$username" || return 1
 
     local user_dir="$USERS_DIR/$username"
     if [ -d "$user_dir" ]; then
@@ -417,6 +428,7 @@ cmd_create_tunnel() {
         log_error "Usage: mcf create tunnel <name> --user <user>"
         return 1
     fi
+    validate_identifier "Tunnel name" "$tunnel_name" || return 1
 
     local user_cert="$USERS_DIR/$username/cert.pem"
     if [ ! -f "$user_cert" ]; then
@@ -506,8 +518,8 @@ cmd_route_tunnel() {
     fi
 
     local user uuid
-    user=$(meta_get "$meta" "user")
-    uuid=$(meta_get "$meta" "uuid")
+    user=$(meta_get "$meta" "user") || true
+    uuid=$(meta_get "$meta" "uuid") || true
     if [ -z "$user" ] || [ -z "$uuid" ]; then
         log_error "Tunnel meta is incomplete (missing user/uuid)."
         return 1
@@ -526,7 +538,8 @@ cmd_route_tunnel() {
         return $ret
     fi
 
-    meta_add_to_array "$meta" "hostnames" "$hostname"
+    meta_add_to_array "$meta" "hostnames" "$hostname" \
+        || log_warning "Routed $hostname but failed to record it in meta."
     log_success "Routed $hostname -> $tunnel_name"
 }
 
@@ -554,9 +567,9 @@ cmd_start_tunnel() {
     [ -f "$creds" ] || { log_error "Credentials file not found: $creds";  return 1; }
 
     local user uuid id
-    user=$(meta_get "$meta" "user")
-    uuid=$(meta_get "$meta" "uuid")
-    id=$(meta_get "$meta" "id")
+    user=$(meta_get "$meta" "user") || true
+    uuid=$(meta_get "$meta" "uuid") || true
+    id=$(meta_get "$meta" "id") || true
     if [ -z "$user" ] || [ -z "$uuid" ]; then
         log_error "Tunnel meta is incomplete (missing user/uuid)."
         return 1
@@ -570,7 +583,7 @@ cmd_start_tunnel() {
     elif [[ "$target" == http* ]]; then
         url="$target"
     elif [ -z "$target" ]; then
-        url=$(meta_get "$meta" "url")
+        url=$(meta_get "$meta" "url") || true
     fi
     if [ -z "$url" ]; then
         log_error "No URL/port provided and no previous URL stored in meta."
@@ -604,7 +617,8 @@ cmd_start_tunnel() {
         return 1
     fi
 
-    meta_set "$meta" "url" "$url"
+    meta_set "$meta" "url" "$url" \
+        || log_warning "Tunnel started but failed to persist URL to meta for $tunnel_name."
     log_success "Started tunnel '$tunnel_name' (ID: ${id:-?}, PID: $pid) -> $url"
 }
 
@@ -660,8 +674,8 @@ cmd_delete_tunnel() {
 
     local user="" uuid=""
     if [ -f "$meta" ]; then
-        user=$(meta_get "$meta" "user")
-        uuid=$(meta_get "$meta" "uuid")
+        user=$(meta_get "$meta" "user") || true
+        uuid=$(meta_get "$meta" "uuid") || true
     fi
 
     if [ -n "$uuid" ] && [ -n "$user" ]; then
@@ -681,13 +695,13 @@ cmd_delete_tunnel() {
         fi
 
         local api_token hostnames
-        api_token=$(read_user_api_token "$user")
-        hostnames=$(meta_get_array "$meta" "hostnames")
+        api_token=$(read_user_api_token "$user") || true
+        hostnames=$(meta_get_array "$meta" "hostnames") || true
         if [ -n "$hostnames" ]; then
             local hn
             while IFS= read -r hn; do
                 [ -z "$hn" ] && continue
-                cf_delete_dns_record "$api_token" "$hn" || true
+                cf_delete_dns_record "$api_token" "$hn" "$user" || true
             done <<< "$hostnames"
         fi
     else
@@ -695,6 +709,7 @@ cmd_delete_tunnel() {
     fi
 
     rm -rf "$tunnel_dir"
+    rm -f "$LOGS_DIR/$tunnel_name.log"
     log_success "Deleted tunnel $tunnel_name"
 }
 
@@ -753,8 +768,8 @@ cmd_list_tunnels() {
     while IFS=$'\t' read -r id meta; do
         [ -f "$meta" ] || continue
         name=$(basename "$(dirname "$meta")")
-        user=$(meta_get "$meta" "user")
-        url=$(meta_get "$meta" "url")
+        user=$(meta_get "$meta" "user") || true
+        url=$(meta_get "$meta" "url") || true
         hostnames=$(meta_get_array "$meta" "hostnames" | paste -sd, - 2>/dev/null || true)
         [ -z "$user" ]      && user="?"
         [ -z "$url" ]       && url="-"
@@ -819,7 +834,7 @@ cmd_purge_user() {
     local meta name owner
     for meta in "$TUNNELS_DIR"/*/meta; do
         [ -f "$meta" ] || continue
-        owner=$(meta_get "$meta" "user")
+        owner=$(meta_get "$meta" "user") || true
         if [ "$owner" = "$username" ]; then
             name=$(basename "$(dirname "$meta")")
             log_info "Purging tunnel: $name"
@@ -831,6 +846,9 @@ cmd_purge_user() {
     log_success "User '$username' purged."
 }
 
+# Note: only tunnel names are saved. The URL each tunnel runs against is
+# persisted to its meta on every successful `start`, and `resurrect` reads it
+# back from there. Snapshot stays minimal on purpose.
 cmd_save() {
     log_info "Saving running tunnels..."
     : > "$DUMP_FILE"
@@ -867,7 +885,17 @@ cmd_startup() {
     local mcf_path
     mcf_path=$(realpath "$0")
 
-    log_info "Generating systemd service..."
+    # Under `sudo mcf startup`, $USER/$HOME are root's, but the data lives in the
+    # invoking user's home. Resolve the real user so the unit points at it.
+    local effective_user="${SUDO_USER:-$USER}"
+    local effective_home
+    effective_home=$(getent passwd "$effective_user" | cut -d: -f6 || true)
+    if [ -z "$effective_home" ]; then
+        log_error "Cannot resolve home directory for $effective_user"
+        return 1
+    fi
+
+    log_info "Generating systemd service for user '$effective_user'..."
     local svc_content
     svc_content=$(cat <<EOF
 [Unit]
@@ -876,9 +904,9 @@ After=network.target
 
 [Service]
 Type=forking
-User=$USER
+User=$effective_user
 ExecStart=$mcf_path resurrect
-Environment=HOME=$HOME
+Environment=HOME=$effective_home
 
 [Install]
 WantedBy=multi-user.target
